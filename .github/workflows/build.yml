@@ -1,0 +1,179 @@
+name: FerrariPOS - Entrega completa
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ferraripos-build-completo
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows EXE + Setup + Licencias
+    runs-on: windows-latest
+    steps:
+      - name: Checkout version actual
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Validar Central Server para Render
+        shell: powershell
+        run: |
+          dotnet restore Nexo/FerrariPOS.CentralServer/FerrariPOS.CentralServer.csproj
+          dotnet build Nexo/FerrariPOS.CentralServer/FerrariPOS.CentralServer.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'Central Server no compila; se detiene la entrega.' }
+
+      - name: Publicar FerrariPOS Windows EXE
+        working-directory: FerrariPOS.Windows
+        shell: powershell
+        run: |
+          if (Test-Path EXE) { Remove-Item EXE -Recurse -Force }
+          New-Item -ItemType Directory -Path EXE | Out-Null
+          dotnet restore FerrariPOS.csproj -r win-x64
+          dotnet publish FerrariPOS.csproj -c Release -r win-x64 --self-contained true --no-restore -o EXE -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false
+          if (!(Test-Path EXE/FerrarisPOS.exe)) { throw 'No se genero FerrarisPOS.exe.' }
+
+      - name: Preparar Inno Setup 6
+        shell: powershell
+        run: |
+          # Buscar primero una instalacion ya existente.
+          # IMPORTANTE: ProgramFiles(x86) debe referenciarse con ${env:ProgramFiles(x86)}
+          # porque PowerShell interpreta $env:ProgramFiles(x86) de forma incorrecta.
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+            "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $iscc = $candidates | Select-Object -First 1
+
+          # Si no esta visible por PATH, comprobar tambien el ejecutable registrado.
+          if (-not $iscc) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $iscc = $cmd.Source }
+          }
+
+          # Solo instalar si realmente no existe. Si Chocolatey dice que ya esta instalado,
+          # volvemos a localizarlo en las rutas habituales y no fallamos por ese mensaje.
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+              "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { $_ -and (Test-Path $_) }
+            $iscc = $candidates | Select-Object -First 1
+          }
+
+          if (-not $iscc) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $iscc = $cmd.Source }
+          }
+
+          if (-not $iscc) {
+            throw 'No se encontro Inno Setup 6 (ISCC.exe) despues de instalar/verificar Chocolatey.'
+          }
+
+          Write-Host "Inno Setup encontrado en: $iscc"
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Crear Windows Setup
+        working-directory: FerrariPOS.Windows
+        shell: powershell
+        run: |
+          if (Test-Path Installer) { Remove-Item Installer -Recurse -Force }
+          New-Item -ItemType Directory -Path Installer | Out-Null
+          & "$env:ISCC" /DProjectDir="$PWD" /DBuildDir="$PWD\EXE" /DOutputDir="$PWD\Installer" "$PWD\Setup_FerrariPOS_V73_1_57.iss"
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup fallo al crear el instalador.' }
+          $setup = Get-ChildItem Installer -Filter *.exe | Select-Object -First 1
+          if (-not $setup) { throw 'No se genero el Windows Setup.' }
+
+      - name: Publicar Windows EXE como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: FerrariPOS-Windows-EXE
+          path: FerrariPOS.Windows/EXE/FerrarisPOS.exe
+          if-no-files-found: error
+
+      - name: Publicar Windows Setup como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: FerrariPOS-Windows-Setup
+          path: FerrariPOS.Windows/Installer/*.exe
+          if-no-files-found: error
+
+      - name: Publicar Windows Licencias EXE
+        working-directory: FerrariPOS.LicenseManager.Windows
+        shell: powershell
+        run: |
+          if (Test-Path publish) { Remove-Item publish -Recurse -Force }
+          New-Item -ItemType Directory -Path publish | Out-Null
+          dotnet restore FerrariPOS_LicenseManager_Corregido.csproj -r win-x64
+          dotnet publish FerrariPOS_LicenseManager_Corregido.csproj -c Release -r win-x64 --self-contained true --no-restore -o publish -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false
+          if (!(Test-Path publish/FerrariPOS_LicenseManager_Corregido.exe)) { throw 'No se genero el EXE de Licencias Windows.' }
+          Copy-Item private_key.pem publish/private_key.pem -Force
+          Copy-Item FerrariPOS_icono.ico publish/FerrariPOS_icono.ico -Force
+
+      - name: Publicar Windows Licencias como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: FerrariPOS-Windows-Licencias-EXE
+          path: FerrariPOS.LicenseManager.Windows/publish/FerrariPOS_LicenseManager_Corregido.exe
+          if-no-files-found: error
+
+  android:
+    name: Android Manager + Android Licencias
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout version actual
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Permisos Gradle
+        shell: bash
+        run: |
+          chmod +x FerrariPOS.Manager.Android/gradlew
+          chmod +x FerrariPOS.LicenseAdmin.Android/gradlew
+
+      - name: Compilar Android Manager
+        working-directory: FerrariPOS.Manager.Android
+        shell: bash
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Compilar Android Licencias
+        working-directory: FerrariPOS.LicenseAdmin.Android
+        shell: bash
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verificar APKs
+        shell: bash
+        run: |
+          test -f FerrariPOS.Manager.Android/app/build/outputs/apk/release/app-release.apk
+          test -f FerrariPOS.LicenseAdmin.Android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Publicar Android Manager
+        uses: actions/upload-artifact@v4
+        with:
+          name: FerrariPOS-Android-Manager
+          path: FerrariPOS.Manager.Android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Publicar Android Licencias
+        uses: actions/upload-artifact@v4
+        with:
+          name: FerrariPOS-Android-Licencias
+          path: FerrariPOS.LicenseAdmin.Android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error

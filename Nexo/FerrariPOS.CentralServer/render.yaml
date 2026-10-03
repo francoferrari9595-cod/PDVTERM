@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: ferraripos-central
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ASPNETCORE_URLS
+        value: http://0.0.0.0:10000
